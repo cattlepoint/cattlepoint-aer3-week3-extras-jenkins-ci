@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  t2.medium Ubuntu 22.04 host with Jenkins, Docker, Node.js 20, Python 3,
+  AWS CLI v2, kubectl, eksctl, Java 17 and EC2 Instance Connect. Jenkins is
+  reachable only via a load balancer on port 80.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  LatestUbuntuAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+
+Resources:
+  LoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP access to the load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  JenkinsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and Jenkins from the load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSG
+
+  JenkinsInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      ImageId: !Ref LatestUbuntuAmiId
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId: !Select [0, !Ref PublicSubnets]
+          AssociatePublicIpAddress: true
+          GroupSet: [!Ref JenkinsSG]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 40
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: Jenkins
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          apt-get update
+          apt-get install -y \
+            ec2-instance-connect \
+            openjdk-17-jdk \
+            curl gnupg lsb-release unzip git docker.io \
+            python3 python3-pip ca-certificates apt-transport-https
+
+          # Jenkins
+          curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | tee /usr/share/keyrings/jenkins-keyring.asc >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" | tee /etc/apt/sources.list.d/jenkins.list
+
+          # Node.js 20 (LTS)
+          curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+
+          apt-get update
+          apt-get install -y jenkins nodejs
+
+          # AWS CLI v2
+          curl -o /tmp/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install
+
+          # kubectl (latest)
+          curl -Lo /usr/local/bin/kubectl https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+
+          # eksctl (latest)
+          curl -sL "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /usr/local/bin
+
+          # Docker permissions
+          usermod -aG docker jenkins
+          usermod -aG docker ubuntu
+
+          # Enable services
+          systemctl enable --now docker
+          systemctl enable --now jenkins
+          systemctl enable --now ec2-instance-connect
+
+  JenkinsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref JenkinsInstance
+          Port: 8080
+
+  JenkinsLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnets
+      SecurityGroups: [!Ref LoadBalancerSG]
+
+  JenkinsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref JenkinsLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref JenkinsTargetGroup
+
+Outputs:
+  JenkinsURL:
+    Value: !Sub "http://${JenkinsLoadBalancer.DNSName}"
+  InstanceId:
+    Value: !Ref JenkinsInstance
